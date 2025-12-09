@@ -1,4 +1,4 @@
-using FunctionAppRegUbicacion.Services;
+Ôªøusing FunctionAppRegUbicacion.Services;
 using Google.Cloud.Firestore;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Http;
@@ -17,13 +17,11 @@ public class UbicacionDto
     public double Longitud { get; set; }
     public string Nombre { get; set; }
 }
-
 public class RegistrarUbicacion
 {
     private readonly ILogger<RegistrarUbicacion> _logger;
     private readonly IFirestoreService _firestoreService;
 
-    // InyecciÛn de dependencias
     public RegistrarUbicacion(
         ILogger<RegistrarUbicacion> logger,
         IFirestoreService firestoreService)
@@ -38,6 +36,18 @@ public class RegistrarUbicacion
         FunctionContext executionContext)
     {
         _logger.LogInformation("RegistrarUbicacion processed a request.");
+
+        // ‚¨áÔ∏è NUEVO: Verificar salud de servicios ANTES de procesar
+        var healthCheck = await CheckServicesHealthAsync();
+        if (!healthCheck.isHealthy)
+        {
+            _logger.LogWarning($"Service health check failed: {healthCheck.reason}");
+            return await CreateErrorResponse(
+                req,
+                HttpStatusCode.ServiceUnavailable,
+                $"Servicio temporalmente no disponible: {healthCheck.reason}"
+            );
+        }
 
         // Deserializar y validar datos
         var (isValid, data, errorResponse) = await ValidateRequestAsync(req);
@@ -62,19 +72,54 @@ public class RegistrarUbicacion
             // Guardar en Firestore usando el servicio inyectado
             await _firestoreService.SaveLocationAsync(data.CamionId, locationData);
 
-            _logger.LogInformation($"UbicaciÛn actualizada correctamente en Firestore para camiÛn {data.CamionId}");
+            _logger.LogInformation($"Ubicaci√≥n actualizada correctamente en Firestore para cami√≥n {data.CamionId}");
 
-            // Guardar tambiÈn en SQL Server (opcional)
+            // Guardar tambi√©n en SQL Server (opcional)
             await SaveToSqlServerAsync(data);
 
             var okResponse = req.CreateResponse(HttpStatusCode.OK);
-            await okResponse.WriteStringAsync($"UbicaciÛn registrada correctamente para camiÛn {data.CamionId}");
+            await okResponse.WriteStringAsync($"Ubicaci√≥n registrada correctamente para cami√≥n {data.CamionId}");
             return okResponse;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error al registrar ubicaciÛn");
-            return await CreateErrorResponse(req, HttpStatusCode.InternalServerError, "Error al registrar ubicaciÛn");
+            _logger.LogError(ex, "Error al registrar ubicaci√≥n");
+            return await CreateErrorResponse(req, HttpStatusCode.InternalServerError, "Error al registrar ubicaci√≥n");
+        }
+    }
+
+    /// <summary>
+    /// Verifica r√°pidamente la salud de los servicios cr√≠ticos
+    /// </summary>
+    private async Task<(bool isHealthy, string reason)> CheckServicesHealthAsync()
+    {
+        try
+        {
+            // Verificar Firestore (cr√≠tico)
+            var firestoreTask = _firestoreService.CheckConnectionAsync();
+
+            // Timeout de 3 segundos para no bloquear mucho
+            var completedTask = await Task.WhenAny(
+                firestoreTask,
+                Task.Delay(TimeSpan.FromSeconds(3))
+            );
+
+            if (completedTask != firestoreTask)
+            {
+                _logger.LogWarning("Firestore health check timeout");
+                return (false, "Firestore no responde");
+            }
+
+            // Si lleg√≥ aqu√≠, Firestore est√° OK
+            await firestoreTask; // Obtener el resultado
+
+            _logger.LogDebug("Services health check passed");
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Services health check failed");
+            return (false, $"Firestore no disponible: {ex.Message}");
         }
     }
 
@@ -83,7 +128,7 @@ public class RegistrarUbicacion
         string body = await new StreamReader(req.Body).ReadToEndAsync();
         if (string.IsNullOrEmpty(body))
         {
-            return (false, null, await CreateBadResponse(req, "El body de la peticiÛn no puede estar vacÌo"));
+            return (false, null, await CreateBadResponse(req, "El body de la petici√≥n no puede estar vac√≠o"));
         }
 
         UbicacionDto data;
@@ -94,13 +139,13 @@ public class RegistrarUbicacion
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "JSON inv·lido");
-            return (false, null, await CreateBadResponse(req, "El formato JSON es inv·lido"));
+            _logger.LogWarning(ex, "JSON inv√°lido");
+            return (false, null, await CreateBadResponse(req, "El formato JSON es inv√°lido"));
         }
 
         if (data == null)
         {
-            return (false, null, await CreateBadResponse(req, "Formato de datos inv·lido"));
+            return (false, null, await CreateBadResponse(req, "Formato de datos inv√°lido"));
         }
 
         if (string.IsNullOrEmpty(data.CamionId))
@@ -147,7 +192,7 @@ public class RegistrarUbicacion
 
             if (string.IsNullOrEmpty(connStr))
             {
-                _logger.LogWarning("SqlConnectionString no est· configurado, omitiendo guardado en SQL Server");
+                _logger.LogWarning("SqlConnectionString no est√° configurado, omitiendo guardado en SQL Server");
                 return;
             }
 
@@ -163,12 +208,12 @@ public class RegistrarUbicacion
 
             await cmd.ExecuteNonQueryAsync();
 
-            _logger.LogInformation($"UbicaciÛn registrada en SQL Server para camiÛn {data.CamionId}");
+            _logger.LogInformation($"Ubicaci√≥n registrada en SQL Server para cami√≥n {data.CamionId}");
         }
         catch (SqlException ex)
         {
-            _logger.LogError(ex, "Error SQL al guardar ubicaciÛn");
-            throw;
+            _logger.LogError(ex, "Error SQL al guardar ubicaci√≥n (no cr√≠tico)");
+            // No hacer throw porque SQL Server es opcional
         }
     }
 }

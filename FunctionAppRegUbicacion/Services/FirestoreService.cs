@@ -29,4 +29,26 @@ public class FirestoreService : IFirestoreService
             throw;
         }
     }
+    /// <summary>
+    /// Verifica la conectividad realizando una operación simple en Firestore
+    /// </summary>
+    public async Task CheckConnectionAsync()
+    {
+        try
+        {
+            // Intenta leer una colección (sin importar si existe)
+            // Esto forzará una conexión a Firestore para verificar que funciona
+            var collection = _db.Collection("health-check");
+            var query = collection.Limit(1);
+
+            await query.GetSnapshotAsync();
+
+            _logger.LogInformation("Firestore connection verified successfully");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to verify Firestore connection");
+            throw;
+        }
+    }
 }
