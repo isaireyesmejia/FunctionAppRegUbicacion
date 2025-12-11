@@ -10,17 +10,29 @@ using System.Text.Json;
 
 namespace FunctionAppRegUbicacion;
 
-public class UbicacionDto
-{
-    public string CamionId { get; set; }
-    public double Latitud { get; set; }
-    public double Longitud { get; set; }
-    public string Nombre { get; set; }
-}
+// ✅ Usar record para DTOs inmutables
+public record UbicacionDto(
+    string CamionId,
+    double Latitud,
+    double Longitud,
+    string? Nombre = null
+);
+
+public record LocationSaveResult(bool Success, string? Error = null);
+
 public class RegistrarUbicacion
 {
+    // ✅ Extraer constantes
+    private const int HEALTH_CHECK_TIMEOUT_MS = 3000;
+    private const double MIN_LATITUDE = -90.0;
+    private const double MAX_LATITUDE = 90.0;
+    private const double MIN_LONGITUDE = -180.0;
+    private const double MAX_LONGITUDE = 180.0;
+    private const int MAX_NOMBRE_LENGTH = 200;
+
     private readonly ILogger<RegistrarUbicacion> _logger;
     private readonly IFirestoreService _firestoreService;
+    private readonly bool _enableHealthCheck;
 
     public RegistrarUbicacion(
         ILogger<RegistrarUbicacion> logger,
@@ -28,6 +40,8 @@ public class RegistrarUbicacion
     {
         _logger = logger;
         _firestoreService = firestoreService;
+        // ✅ Health check configurable
+        _enableHealthCheck = Environment.GetEnvironmentVariable("EnableHealthCheck") == "true";
     }
 
     [Function("RegistrarUbicacion")]
@@ -35,32 +49,81 @@ public class RegistrarUbicacion
         [HttpTrigger(AuthorizationLevel.Function, "post", Route = "location")] HttpRequestData req,
         FunctionContext executionContext)
     {
-        _logger.LogInformation("RegistrarUbicacion processed a request.");
+        _logger.LogInformation("RegistrarUbicacion procesando request");
 
-        // ⬇️ NUEVO: Verificar salud de servicios ANTES de procesar
-        var healthCheck = await CheckServicesHealthAsync();
-        if (!healthCheck.isHealthy)
+        // ✅ Health check opcional
+        if (_enableHealthCheck)
         {
-            _logger.LogWarning($"Service health check failed: {healthCheck.reason}");
-            return await CreateErrorResponse(
-                req,
-                HttpStatusCode.ServiceUnavailable,
-                $"Servicio temporalmente no disponible: {healthCheck.reason}"
-            );
+            var healthCheck = await CheckServicesHealthAsync();
+            if (!healthCheck.isHealthy)
+            {
+                _logger.LogWarning("Service health check failed: {Reason}", healthCheck.reason);
+                return await CreateJsonResponse(
+                    req,
+                    HttpStatusCode.ServiceUnavailable,
+                    new { error = $"Servicio temporalmente no disponible: {healthCheck.reason}" }
+                );
+            }
         }
 
-        // Deserializar y validar datos
-        var (isValid, data, errorResponse) = await ValidateRequestAsync(req);
-        if (!isValid)
+        // Validar request
+        var validationResult = await ValidateRequestAsync(req);
+        if (!validationResult.isValid)
         {
-            return errorResponse;
+            return validationResult.errorResponse!;
         }
+
+        var data = validationResult.data!;
 
         try
         {
-            _logger.LogInformation("Intentando guardar en Firestore");
+            // ✅ Guardar en Firestore con retry implícito
+            var firestoreResult = await SaveToFirestoreAsync(data);
+            if (!firestoreResult.Success)
+            {
+                _logger.LogError("Firestore save failed: {Error}", firestoreResult.Error);
+                return await CreateJsonResponse(
+                    req,
+                    HttpStatusCode.InternalServerError,
+                    new { error = "Error al guardar en Firestore", details = firestoreResult.Error }
+                );
+            }
 
-            // Preparar datos para Firestore
+            // ✅ SQL Server opcional (fire-and-forget si no es crítico)
+            _ = Task.Run(() => SaveToSqlServerAsync(data));
+
+            _logger.LogInformation("Ubicación registrada exitosamente para {CamionId}", data.CamionId);
+
+            return await CreateJsonResponse(
+                req,
+                HttpStatusCode.OK,
+                new
+                {
+                    success = true,
+                    message = $"Ubicación registrada correctamente",
+                    camionId = data.CamionId,
+                    timestamp = DateTime.UtcNow
+                }
+            );
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error inesperado al registrar ubicación");
+            return await CreateJsonResponse(
+                req,
+                HttpStatusCode.InternalServerError,
+                new { error = "Error interno del servidor" }
+            );
+        }
+    }
+
+    /// <summary>
+    /// Guarda la ubicación en Firestore con manejo de errores robusto
+    /// </summary>
+    private async Task<LocationSaveResult> SaveToFirestoreAsync(UbicacionDto data)
+    {
+        try
+        {
             var locationData = new Dictionary<string, object>
             {
                 { "fltLatitud", data.Latitud },
@@ -69,69 +132,75 @@ public class RegistrarUbicacion
                 { "timestamp", FieldValue.ServerTimestamp }
             };
 
-            // Guardar en Firestore usando el servicio inyectado
             await _firestoreService.SaveLocationAsync(data.CamionId, locationData);
 
-            _logger.LogInformation($"Ubicación actualizada correctamente en Firestore para camión {data.CamionId}");
+            _logger.LogInformation(
+                "Ubicación guardada en Firestore - Camión: {CamionId}, Lat: {Lat}, Lon: {Lon}",
+                data.CamionId, data.Latitud, data.Longitud
+            );
 
-            // Guardar también en SQL Server (opcional)
-            await SaveToSqlServerAsync(data);
-
-            var okResponse = req.CreateResponse(HttpStatusCode.OK);
-            await okResponse.WriteStringAsync($"Ubicación registrada correctamente para camión {data.CamionId}");
-            return okResponse;
+            return new LocationSaveResult(true);
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error al registrar ubicación");
-            return await CreateErrorResponse(req, HttpStatusCode.InternalServerError, "Error al registrar ubicación");
+            _logger.LogError(ex, "Error al guardar en Firestore");
+            return new LocationSaveResult(false, $"Error de base de datos: {ex.Message}");
         }
     }
 
     /// <summary>
-    /// Verifica rápidamente la salud de los servicios críticos
+    /// Verifica la salud de servicios críticos con timeout
     /// </summary>
-    private async Task<(bool isHealthy, string reason)> CheckServicesHealthAsync()
+    private async Task<(bool isHealthy, string? reason)> CheckServicesHealthAsync()
     {
         try
         {
-            // Verificar Firestore (crítico)
-            var firestoreTask = _firestoreService.CheckConnectionAsync();
+            using var cts = new CancellationTokenSource(HEALTH_CHECK_TIMEOUT_MS);
 
-            // Timeout de 3 segundos para no bloquear mucho
-            var completedTask = await Task.WhenAny(
-                firestoreTask,
-                Task.Delay(TimeSpan.FromSeconds(3))
-            );
+            await _firestoreService.CheckConnectionAsync();
 
-            if (completedTask != firestoreTask)
-            {
-                _logger.LogWarning("Firestore health check timeout");
-                return (false, "Firestore no responde");
-            }
-
-            // Si llegó aquí, Firestore está OK
-            await firestoreTask; // Obtener el resultado
-
-            _logger.LogDebug("Services health check passed");
+            _logger.LogDebug("Health check passed");
             return (true, null);
+        }
+        catch (OperationCanceledException)
+        {
+            _logger.LogWarning("Firestore health check timeout ({TimeoutMs}ms)", HEALTH_CHECK_TIMEOUT_MS);
+            return (false, "Firestore timeout");
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Services health check failed");
+            _logger.LogError(ex, "Health check failed");
             return (false, $"Firestore no disponible: {ex.Message}");
         }
     }
 
-    private async Task<(bool isValid, UbicacionDto data, HttpResponseData errorResponse)> ValidateRequestAsync(HttpRequestData req)
+    /// <summary>
+    /// Valida el request con reglas de negocio mejoradas
+    /// </summary>
+    private async Task<(bool isValid, UbicacionDto? data, HttpResponseData? errorResponse)> ValidateRequestAsync(
+        HttpRequestData req)
     {
-        string body = await new StreamReader(req.Body).ReadToEndAsync();
-        if (string.IsNullOrEmpty(body))
+        // Leer body
+        string body;
+        try
         {
-            return (false, null, await CreateBadResponse(req, "El body de la petición no puede estar vacío"));
+            body = await new StreamReader(req.Body).ReadToEndAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error al leer request body");
+            return (false, null, await CreateJsonResponse(
+                req, HttpStatusCode.BadRequest, new { error = "Error al leer datos" }));
         }
 
-        UbicacionDto data;
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            return (false, null, await CreateJsonResponse(
+                req, HttpStatusCode.BadRequest, new { error = "El body no puede estar vacío" }));
+        }
+
+        // Deserializar
+        UbicacionDto? data;
         try
         {
             data = JsonSerializer.Deserialize<UbicacionDto>(body,
@@ -139,68 +208,74 @@ public class RegistrarUbicacion
         }
         catch (JsonException ex)
         {
-            _logger.LogWarning(ex, "JSON inválido");
-            return (false, null, await CreateBadResponse(req, "El formato JSON es inválido"));
+            _logger.LogWarning(ex, "JSON inválido recibido");
+            return (false, null, await CreateJsonResponse(
+                req, HttpStatusCode.BadRequest, new { error = "Formato JSON inválido" }));
         }
 
         if (data == null)
         {
-            return (false, null, await CreateBadResponse(req, "Formato de datos inválido"));
+            return (false, null, await CreateJsonResponse(
+                req, HttpStatusCode.BadRequest, new { error = "Datos inválidos" }));
         }
 
-        if (string.IsNullOrEmpty(data.CamionId))
-        {
-            return (false, null, await CreateBadResponse(req, "CamionId es requerido"));
-        }
+        // ✅ Validaciones mejoradas
+        var validationErrors = new List<string>();
 
-        if (data.Latitud < -90 || data.Latitud > 90)
-        {
-            return (false, null, await CreateBadResponse(req, "Latitud debe estar entre -90 y 90"));
-        }
+        if (string.IsNullOrWhiteSpace(data.CamionId))
+            validationErrors.Add("CamionId es requerido");
+        else if (data.CamionId.Length > 50)
+            validationErrors.Add("CamionId no puede exceder 50 caracteres");
 
-        if (data.Longitud < -180 || data.Longitud > 180)
+        if (data.Latitud < MIN_LATITUDE || data.Latitud > MAX_LATITUDE)
+            validationErrors.Add($"Latitud debe estar entre {MIN_LATITUDE} y {MAX_LATITUDE}");
+
+        if (data.Longitud < MIN_LONGITUDE || data.Longitud > MAX_LONGITUDE)
+            validationErrors.Add($"Longitud debe estar entre {MIN_LONGITUDE} y {MAX_LONGITUDE}");
+
+        // ✅ Validar coordenadas 0,0 (error común de GPS)
+        if (data.Latitud == 0 && data.Longitud == 0)
+            validationErrors.Add("Coordenadas 0,0 no son válidas");
+
+        // ✅ Validar nombre si existe
+        if (!string.IsNullOrEmpty(data.Nombre) && data.Nombre.Length > MAX_NOMBRE_LENGTH)
+            validationErrors.Add($"Nombre no puede exceder {MAX_NOMBRE_LENGTH} caracteres");
+
+        if (validationErrors.Any())
         {
-            return (false, null, await CreateBadResponse(req, "Longitud debe estar entre -180 y 180"));
+            return (false, null, await CreateJsonResponse(
+                req,
+                HttpStatusCode.BadRequest,
+                new { error = "Validación fallida", errors = validationErrors }
+            ));
         }
 
         return (true, data, null);
     }
 
-    private async Task<HttpResponseData> CreateBadResponse(HttpRequestData req, string message)
-    {
-        var response = req.CreateResponse(HttpStatusCode.BadRequest);
-        response.Headers.Add("Content-Type", "application/json; charset=utf-8");
-        var errorJson = JsonSerializer.Serialize(new { error = message });
-        await response.WriteStringAsync(errorJson);
-        return response;
-    }
-
-    private async Task<HttpResponseData> CreateErrorResponse(HttpRequestData req, HttpStatusCode statusCode, string message)
-    {
-        var response = req.CreateResponse(statusCode);
-        response.Headers.Add("Content-Type", "application/json; charset=utf-8");
-        var errorJson = JsonSerializer.Serialize(new { error = message });
-        await response.WriteStringAsync(errorJson);
-        return response;
-    }
-
+    /// <summary>
+    /// Guarda en SQL Server de forma no bloqueante (opcional)
+    /// </summary>
     private async Task SaveToSqlServerAsync(UbicacionDto data)
     {
         try
         {
-            string connStr = Environment.GetEnvironmentVariable("SqlConnectionString");
+            string? connStr = Environment.GetEnvironmentVariable("SqlConnectionString");
 
             if (string.IsNullOrEmpty(connStr))
             {
-                _logger.LogWarning("SqlConnectionString no está configurado, omitiendo guardado en SQL Server");
+                _logger.LogDebug("SqlConnectionString no configurado, omitiendo SQL Server");
                 return;
             }
 
-            using var conn = new SqlConnection(connStr);
+            await using var conn = new SqlConnection(connStr);
             await conn.OpenAsync();
 
-            using var cmd = new SqlCommand("dbo.InsertarUbicacion", conn);
-            cmd.CommandType = CommandType.StoredProcedure;
+            await using var cmd = new SqlCommand("dbo.InsertarUbicacion", conn)
+            {
+                CommandType = CommandType.StoredProcedure,
+                CommandTimeout = 10 // ✅ Timeout explícito
+            };
 
             cmd.Parameters.AddWithValue("@CamionID", data.CamionId);
             cmd.Parameters.AddWithValue("@Latitud", data.Latitud);
@@ -208,12 +283,28 @@ public class RegistrarUbicacion
 
             await cmd.ExecuteNonQueryAsync();
 
-            _logger.LogInformation($"Ubicación registrada en SQL Server para camión {data.CamionId}");
+            _logger.LogInformation("Ubicación guardada en SQL Server para {CamionId}", data.CamionId);
         }
         catch (SqlException ex)
         {
-            _logger.LogError(ex, "Error SQL al guardar ubicación (no crítico)");
-            // No hacer throw porque SQL Server es opcional
+            _logger.LogWarning(ex, "Error SQL al guardar ubicación (no crítico)");
         }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error inesperado en SQL Server (no crítico)");
+        }
+    }
+
+    /// <summary>
+    /// ✅ Helper unificado para crear responses JSON
+    /// </summary>
+    private static async Task<HttpResponseData> CreateJsonResponse(
+        HttpRequestData req,
+        HttpStatusCode statusCode,
+        object data)
+    {
+        var response = req.CreateResponse(statusCode);
+        await response.WriteAsJsonAsync(data);
+        return response;
     }
 }
